@@ -1,0 +1,24 @@
+[
+  {
+    "id": 1779201021291,
+    "timestamp": "2026-05-19T14:30:21.291Z",
+    "instrument": "XAUUSD",
+    "signal": "BUY",
+    "quality": "B",
+    "confidence": "Medium",
+    "session": "London/NY Overlap (optimal)",
+    "source": "auto-scan",
+    "outcome": "pending"
+  },
+  {
+    "id": 2,
+    "timestamp": "2026-05-22T13:30:37.670Z",
+    "instrument": "XAUUSD",
+    "signal": "SELL",
+    "quality": "A",
+    "confidence": "High",
+    "session": "London/NY Overlap",
+    "source": "auto",
+    "outcome": "pending"
+  }
+]
