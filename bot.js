@@ -12,7 +12,6 @@ const NEWS_API_KEY = process.env.NEWS_API_KEY;
 const ALERT_CHAT_IDS = (process.env.ALERT_CHAT_IDS || "")
   .split(",")
   .filter(Boolean);
-const COOLDOWN_MINUTES = 120;
 const DAILY_CREDIT_LIMIT = 750;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {
@@ -23,6 +22,9 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, {
   },
 });
 
+// ─── Bot State ────────────────────────────────────────────────────────────────
+let botActive = true;
+
 // ─── Duplicate Command Guard ──────────────────────────────────────────────────
 const processingCommands = new Set();
 function isProcessing(chatId, command) {
@@ -31,6 +33,35 @@ function isProcessing(chatId, command) {
   processingCommands.add(key);
   setTimeout(() => processingCommands.delete(key), 90000);
   return false;
+}
+
+// ─── HTML Sanitizer ───────────────────────────────────────────────────────────
+function sanitizeHTML(text) {
+  return text
+    .replace(
+      /<(?!\/?b>|\/?strong>|\/?i>|\/?em>|\/?code>|\/?pre>|\/?a[\s>])[^>]*>/gi,
+      "",
+    )
+    .replace(/&(?!amp;|lt;|gt;|quot;|#\d+;)/g, "&amp;");
+}
+
+// ─── Safe Send ────────────────────────────────────────────────────────────────
+async function safeSend(chatId, text, options = {}) {
+  try {
+    await bot.sendMessage(chatId, sanitizeHTML(text), {
+      parse_mode: "HTML",
+      ...options,
+    });
+  } catch (err) {
+    console.error("safeSend error:", err.message);
+    // Fallback: send without HTML parsing
+    try {
+      const plain = text.replace(/<[^>]*>/g, "").replace(/&amp;/g, "&");
+      await bot.sendMessage(chatId, plain);
+    } catch (e) {
+      console.error("safeSend fallback failed:", e.message);
+    }
+  }
 }
 
 // ─── Credit Tracker ───────────────────────────────────────────────────────────
@@ -73,7 +104,6 @@ function hasCredits(needed = 1) {
   return creditsRemaining() >= needed;
 }
 
-// ─── Startup Credit Reset ─────────────────────────────────────────────────────
 function checkCreditReset() {
   const today = new Date().toISOString().split("T")[0];
   try {
@@ -182,7 +212,7 @@ function recordLoss() {
   if (consecutiveLosses >= 3) {
     botPausedUntil = Date.now() + 24 * 60 * 60 * 1000;
     broadcast(
-      `<b>DRAWDOWN PROTECTION</b>\n\n3 consecutive losses. Bot paused 24 hours.\nReview your trades: /journal`,
+      "DRAWDOWN PROTECTION\n\n3 consecutive losses. Bot paused 24 hours.\nReview your trades: /journal",
     );
     return true;
   }
@@ -222,49 +252,36 @@ function getSession() {
   };
 }
 
-// ─── Twelve Data Fetcher ──────────────────────────────────────────────────────
+// ─── Delay Helper ─────────────────────────────────────────────────────────────
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ─── Twelve Data Fetcher ──────────────────────────────────────────────────────
 async function tdFetch(endpoint, params, cacheKey) {
   const cached = getCached(cacheKey);
   if (cached !== null) {
     console.log(`Cache: ${cacheKey}`);
     return cached;
   }
-
   if (!hasCredits(1)) {
     console.log(`No credits — skip ${cacheKey}`);
     return null;
   }
-
   try {
     const url = `https://api.twelvedata.com/${endpoint}?${params}&apikey=${PRICE_API_KEY}`;
     const res = await axios.get(url, { timeout: 20000 });
-
     if (res.data.code === 429) {
-      console.log(`429 from Twelve Data — marking limit hit`);
-      try {
-        fs.writeFileSync(
-          CREDIT_FILE,
-          JSON.stringify({
-            date: new Date().toISOString().split("T")[0],
-            used: DAILY_CREDIT_LIMIT,
-          }),
-        );
-      } catch {}
+      console.log("429 from Twelve Data — limit hit, waiting...");
       return null;
     }
-
     if (res.data.code) {
       console.log(`TD error (${endpoint}): ${res.data.message}`);
       return null;
     }
-
     addCredit(1);
     setCache(cacheKey, res.data);
     return res.data;
   } catch (err) {
-    console.log(`TD timeout/error (${endpoint}): ${err.message}`);
+    console.log(`TD error (${endpoint}): ${err.message}`);
     return null;
   }
 }
@@ -283,7 +300,7 @@ async function fetchPrice(symbol) {
       setCache("btc_price", price);
       return price;
     }
-    const data = await tdFetch("price", `symbol=XAU%2FUSD`, `price_${symbol}`);
+    const data = await tdFetch("price", "symbol=XAU%2FUSD", `price_${symbol}`);
     return data?.price ? parseFloat(data.price) : null;
   } catch {
     return null;
@@ -453,9 +470,16 @@ async function fetchEconomicEvents() {
 
 // ─── Confluence Scorer ────────────────────────────────────────────────────────
 function scoreConfluence(data) {
-  const { price, rsi1h, rsi30m, rsi4h, ma20_1h, ma50_1h, ma20_4h, macd1h } =
-    data;
-  if (!price) return { score: 0, direction: null, factors: [] };
+  const { price, rsi1h, rsi4h, ma20_1h, ma50_1h, macd1h } = data;
+  if (!price)
+    return {
+      score: 0,
+      direction: null,
+      factors: [],
+      bullish: 0,
+      bearish: 0,
+      total: 0,
+    };
   const p = parseFloat(price);
   const factors = [];
   let bullish = 0,
@@ -470,13 +494,13 @@ function scoreConfluence(data) {
       factors.push(`Price below MA20 1H ($${ma20_1h})`);
     }
   }
-  if (data.ma50_1h) {
-    if (p > parseFloat(data.ma50_1h)) {
+  if (ma50_1h) {
+    if (p > parseFloat(ma50_1h)) {
       bullish++;
-      factors.push(`Price above MA50 1H ($${data.ma50_1h})`);
+      factors.push(`Price above MA50 1H ($${ma50_1h})`);
     } else {
       bearish++;
-      factors.push(`Price below MA50 1H ($${data.ma50_1h})`);
+      factors.push(`Price below MA50 1H ($${ma50_1h})`);
     }
   }
   if (rsi1h) {
@@ -503,14 +527,14 @@ function scoreConfluence(data) {
     const h = parseFloat(macd1h.histogram);
     if (h > 0) {
       bullish++;
-      factors.push(`MACD bullish (hist: ${macd1h.histogram})`);
+      factors.push(`MACD bullish (${macd1h.histogram})`);
     } else {
       bearish++;
-      factors.push(`MACD bearish (hist: ${macd1h.histogram})`);
+      factors.push(`MACD bearish (${macd1h.histogram})`);
     }
   }
-  if (ma20_1h && data.ma50_1h) {
-    if (parseFloat(ma20_1h) > parseFloat(data.ma50_1h)) {
+  if (ma20_1h && ma50_1h) {
+    if (parseFloat(ma20_1h) > parseFloat(ma50_1h)) {
       bullish++;
       factors.push("MA20 above MA50 — uptrend");
     } else {
@@ -569,11 +593,9 @@ async function buildDataBlock(instrument, forceRefresh = false) {
   const confluence = scoreConfluence({
     price,
     rsi1h,
-    rsi30m,
     rsi4h,
     ma20_1h,
     ma50_1h,
-    ma20_4h,
     macd1h,
   });
   const p = price ? parseFloat(price) : 0;
@@ -592,23 +614,18 @@ async function buildDataBlock(instrument, forceRefresh = false) {
   block += `Price: $${price ? parseFloat(price).toLocaleString() : "unavailable"}\n`;
   block += `Session: ${session.name} | ${session.utcStr}\n`;
   block += `High-impact news: ${calendar.hasHighImpact ? "YES — " + calendar.events : "None"}\n\n`;
-
-  block += `--- CONFLUENCE (${confluence.score}/${confluence.total} aligned, bias: ${confluence.direction || "NEUTRAL"}) ---\n`;
+  block += `--- CONFLUENCE (${confluence.score}/${confluence.total} | ${confluence.direction || "NEUTRAL"}) ---\n`;
   block += confluence.factors.map((f) => `  ${f}`).join("\n") + "\n\n";
-
   block += `--- INDICATORS ---\n`;
   block += `ATR(14,1H): ${atr1h || "n/a"}\n`;
   if (atrVal) {
-    block += `BUY levels:  SL $${levels.sl_buy} | TP1 $${levels.tp1_buy} | TP2 $${levels.tp2_buy}\n`;
-    block += `SELL levels: SL $${levels.sl_sell} | TP1 $${levels.tp1_sell} | TP2 $${levels.tp2_sell}\n`;
+    block += `BUY:  SL $${levels.sl_buy} | TP1 $${levels.tp1_buy} | TP2 $${levels.tp2_buy}\n`;
+    block += `SELL: SL $${levels.sl_sell} | TP1 $${levels.tp1_sell} | TP2 $${levels.tp2_sell}\n`;
   }
   if (macd1h)
-    block += `MACD: ${macd1h.macd} | Signal: ${macd1h.signal} | Histogram: ${macd1h.histogram}\n`;
-  block += `\n`;
-
-  block += `--- 4H TREND ---\n`;
+    block += `MACD: ${macd1h.macd} | Signal: ${macd1h.signal} | Hist: ${macd1h.histogram}\n`;
+  block += `\n--- 4H TREND ---\n`;
   block += `RSI: ${rsi4h || "n/a"} | MA20: ${ma20_4h ? "$" + ma20_4h : "n/a"} | MA50: ${ma50_4h ? "$" + ma50_4h : "n/a"}\n\n`;
-
   block += `--- 1H CHART ---\n`;
   block += `RSI: ${rsi1h || "n/a"} | MA20: ${ma20_1h ? "$" + ma20_1h : "n/a"} | MA50: ${ma50_1h ? "$" + ma50_1h : "n/a"}\n`;
   if (candles1h) {
@@ -617,9 +634,7 @@ async function buildDataBlock(instrument, forceRefresh = false) {
       block += `  ${c.time}: ${c.open}/${c.high}/${c.low}/${c.close}\n`;
     });
   }
-  block += `\n`;
-
-  block += `--- 30M CHART ---\n`;
+  block += `\n--- 30M CHART ---\n`;
   block += `RSI: ${rsi30m || "n/a"}\n`;
   if (candles30m) {
     block += `Candles (O/H/L/C):\n`;
@@ -628,7 +643,6 @@ async function buildDataBlock(instrument, forceRefresh = false) {
     });
   }
   block += `\n`;
-
   if (fearGreed)
     block += `--- SENTIMENT ---\nFear & Greed: ${fearGreed.value}/100 — ${fearGreed.label}\n\n`;
   block += `--- NEWS ---\n${news || "No news — analysis based on price action only."}\n`;
@@ -636,7 +650,7 @@ async function buildDataBlock(instrument, forceRefresh = false) {
   return { block, price, session, calendar, confluence, atr: atr1h, levels };
 }
 
-// ─── Prompts ──────────────────────────────────────────────────────────────────
+// ─── System Prompt ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are a professional proprietary trader analyzing short-term setups for a $20 account.
 
 PHILOSOPHY:
@@ -649,45 +663,47 @@ PHILOSOPHY:
 ACCOUNT RULES:
 - Risk: 1% = $0.20 max | Lot: 0.01 only | Min R/R: 1:2
 - SL: ATR-based if available, otherwise nearest swing high/low
-- Timeframe: 4H trend → 1H confirmation → 30M entry
+- Timeframe: 4H trend, 1H confirmation, 30M entry
 
 PRICE ACTION TO APPLY:
 - S/R from swing highs/lows in candle data
 - Patterns: engulfing, pin bar, inside bar, doji, hammer, shooting star
 - Break and retest of key levels
 - Higher highs/lower lows structure
-- MA crossover and price rejection at MA
+- MA crossover and price rejection at MA levels
 - MACD crossover and histogram direction
-- RSI divergence
+- RSI divergence across timeframes
 
-OUTPUT FORMAT:
-INSTRUMENT: [XAUUSD / BTCUSD]
+OUTPUT FORMAT — use exactly this, no markdown symbols, no asterisks, no angle brackets:
+
+INSTRUMENT: [XAUUSD or BTCUSD]
 SIGNAL: [BUY / SELL / NO TRADE]
 TIMEFRAME: [30M / 1H]
 CONFLUENCE: [X/6]
 
 ENTRY: [price]
-STOP LOSS: [price] — [reason]
-TAKE PROFIT 1: [price] — [R/R]
-TAKE PROFIT 2: [price] — [R/R]
-LOT SIZE: 0.01 — $0.20 risk
+STOP LOSS: [price] - [reason]
+TAKE PROFIT 1: [price] - [R/R]
+TAKE PROFIT 2: [price] - [R/R]
+LOT SIZE: 0.01 - $0.20 risk
 
 4H STRUCTURE: [brief]
 1H STRUCTURE: [brief]
 30M STRUCTURE: [brief]
-PATTERN: [name or "none"]
+PATTERN: [name or none]
 MACD: [bullish / bearish / neutral]
 RSI: [key observation]
 KEY S/R: [levels from candle data]
 
 CONFIDENCE: [Low / Medium / High]
 SETUP QUALITY: [A / B / C]
-REASONING: [3 sentences — precise and technical]
+REASONING: [3 sentences - precise and technical]
 
+IMPORTANT: Do not use any HTML tags, markdown, asterisks, or angle brackets in your response.
 If NO TRADE: state what is missing and what price action must occur first.`;
 
 // ─── Claude API ───────────────────────────────────────────────────────────────
-async function callClaude(userMessage, systemPrompt, retries = 2) {
+async function callClaude(userMessage, retries = 2) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const res = await axios.post(
@@ -695,7 +711,7 @@ async function callClaude(userMessage, systemPrompt, retries = 2) {
         {
           model: "claude-sonnet-4-6",
           max_tokens: 1200,
-          system: systemPrompt,
+          system: SYSTEM_PROMPT,
           messages: [{ role: "user", content: userMessage }],
         },
         {
@@ -724,50 +740,56 @@ async function broadcast(text) {
   }
   for (const chatId of ALERT_CHAT_IDS) {
     try {
-      await bot.sendMessage(chatId.trim(), text, { parse_mode: "HTML" });
+      await bot.sendMessage(chatId.trim(), text);
     } catch (err) {
       console.error(`Broadcast failed (${chatId}):`, err.message);
     }
   }
 }
 
-const lastAlertSent = { XAUUSD: null, BTCUSD: null };
-
-// ─── Manual Analysis ──────────────────────────────────────────────────────────
+// ─── Run Analysis ─────────────────────────────────────────────────────────────
 async function runAnalysis(chatId, instrument, forceRefresh = false) {
+  if (!botActive) {
+    bot.sendMessage(chatId, "Bot is stopped. Send /start to reactivate.");
+    return;
+  }
   if (isBotPaused()) {
     bot.sendMessage(
       chatId,
-      "Bot is paused — 3 consecutive losses hit. Resumes in 24 hours. Use /journal to review.",
+      "Bot paused — 3 consecutive losses hit. Resumes in 24 hours. Use /journal to review.",
     );
     return;
   }
 
-  const msg = await bot.sendMessage(
-    chatId,
-    `Analyzing ${instrument}...\nFetching live data (15–25 seconds).\nCredits remaining: ${creditsRemaining()}`,
-  );
+  let msgId = null;
 
   try {
+    const sentMsg = await bot.sendMessage(
+      chatId,
+      `Analyzing ${instrument}...\nFetching live data (15-25 seconds).\nCredits remaining: ${creditsRemaining()}`,
+    );
+    msgId = sentMsg.message_id;
+
     const data = await buildDataBlock(instrument, forceRefresh);
     const analysis = await callClaude(
       data.block + `\nProvide full trade analysis for $20 account trader.`,
-      SYSTEM_PROMPT,
     );
 
-    let header = `<b>${instrument} — ANALYSIS</b>\n`;
-    header += `Session: ${data.session.name} | ${data.session.utcStr}\n`;
-    header += `Confluence: ${data.confluence.score}/${data.confluence.total} | Bias: ${data.confluence.direction || "Neutral"}\n`;
-    if (data.calendar.hasHighImpact)
-      header += `NEWS RISK: High-impact event — trade with caution\n`;
-    header += `Credits used today: ${loadCredits().used}/${DAILY_CREDIT_LIMIT}\n`;
+    const header =
+      `${instrument} - ANALYSIS\n` +
+      `Session: ${data.session.name} | ${data.session.utcStr}\n` +
+      `Confluence: ${data.confluence.score}/${data.confluence.total} | Bias: ${data.confluence.direction || "Neutral"}\n` +
+      (data.calendar.hasHighImpact
+        ? `NEWS RISK: High-impact event active\n`
+        : "") +
+      `Credits used: ${loadCredits().used}/${DAILY_CREDIT_LIMIT}\n\n`;
 
-    await bot.deleteMessage(chatId, msg.message_id);
-    await bot.sendMessage(chatId, `${header}\n${analysis}`, {
-      parse_mode: "HTML",
-    });
+    try {
+      await bot.deleteMessage(chatId, msgId);
+    } catch {}
 
-    // Log to journal
+    await bot.sendMessage(chatId, header + analysis);
+
     logSignal({
       instrument,
       signal: data.confluence.direction || "ANALYZED",
@@ -782,39 +804,69 @@ async function runAnalysis(chatId, instrument, forceRefresh = false) {
       source: "manual",
     });
   } catch (err) {
-    await bot.editMessageText(`Error: ${err.message}`, {
-      chat_id: chatId,
-      message_id: msg.message_id,
-    });
+    console.error("runAnalysis error:", err.message);
+    try {
+      if (msgId) {
+        await bot.editMessageText(`Error: ${err.message.slice(0, 100)}`, {
+          chat_id: chatId,
+          message_id: msgId,
+        });
+      } else {
+        await bot.sendMessage(chatId, `Error occurred. Please try again.`);
+      }
+    } catch {
+      bot.sendMessage(chatId, "Error occurred. Please try again.");
+    }
   }
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, (msg) => {
+  botActive = true;
   bot.sendMessage(
     msg.chat.id,
-    `<b>TradingBot Pro — $20 Account</b>\n\n` +
-      `Professional price action analysis on demand.\n\n` +
-      `<b>How it works:</b>\n` +
-      `- You request analysis when you want it\n` +
-      `- No automatic scanning — saves API credits\n` +
-      `- Data cached 25 mins — second request is instant\n` +
-      `- 6-factor confluence scoring on every analysis\n` +
-      `- Works without news — price action is primary\n\n` +
-      `<b>Commands:</b>\n` +
-      `/gold — Analyze XAUUSD\n` +
-      `/btc — Analyze BTCUSD\n` +
-      `/both — Analyze both\n` +
-      `/refresh — Force fresh data\n` +
-      `/confluence — Live confluence scores\n` +
-      `/session — Current session\n` +
-      `/calendar — Economic events\n` +
-      `/feargreed — BTC sentiment\n` +
-      `/credits — API usage today\n` +
-      `/journal — Trade history\n` +
-      `/win [n] | /loss [n] — Log outcome\n` +
-      `/status | /risk | /sizing | /help`,
-    { parse_mode: "HTML" },
+    `TradingBot Pro - $20 Account\n\n` +
+      `Bot is ACTIVE. Ready to analyze.\n\n` +
+      `MARKET COMMANDS:\n` +
+      `/gold - Analyze XAUUSD\n` +
+      `/btc - Analyze BTCUSD\n` +
+      `/both - Analyze both markets\n` +
+      `/refresh - Force fresh data fetch\n` +
+      `/confluence - Live confluence scores\n\n` +
+      `INFO COMMANDS:\n` +
+      `/session - Current trading session\n` +
+      `/calendar - Economic events today\n` +
+      `/feargreed - BTC Fear & Greed index\n` +
+      `/credits - API usage today\n\n` +
+      `JOURNAL COMMANDS:\n` +
+      `/journal - Trade history and win rate\n` +
+      `/win [n] - Mark trade as win\n` +
+      `/loss [n] - Mark trade as loss\n\n` +
+      `BOT CONTROLS:\n` +
+      `/stop - Pause bot\n` +
+      `/resume - Resume bot\n` +
+      `/status - Bot status\n\n` +
+      `OTHER:\n` +
+      `/risk - Risk rules\n` +
+      `/sizing - Position sizing\n` +
+      `/ask [question] - Ask anything\n` +
+      `/help - This menu`,
+  );
+});
+
+bot.onText(/\/stop/, (msg) => {
+  botActive = false;
+  bot.sendMessage(
+    msg.chat.id,
+    `Bot Paused\n\nAll analysis commands disabled.\nNo API calls will be made.\n\nSend /resume to reactivate.`,
+  );
+});
+
+bot.onText(/\/resume/, (msg) => {
+  botActive = true;
+  bot.sendMessage(
+    msg.chat.id,
+    `Bot Resumed\n\nBot is active again.\nCredits remaining: ${creditsRemaining()}\n\nSend /gold or /btc to get an analysis.`,
   );
 });
 
@@ -829,35 +881,51 @@ bot.onText(/\/btc/, (msg) => {
 });
 
 bot.onText(/\/both/, async (msg) => {
+  if (!botActive) {
+    bot.sendMessage(msg.chat.id, "Bot is stopped. Send /start to reactivate.");
+    return;
+  }
   if (isProcessing(msg.chat.id, "both")) return;
   const chatId = msg.chat.id;
-  const thinking = await bot.sendMessage(
-    chatId,
-    "Analyzing both markets...\nPlease wait 30–40 seconds.",
-  );
+  let msgId = null;
   try {
+    const sentMsg = await bot.sendMessage(
+      chatId,
+      "Analyzing both markets...\nPlease wait 30-40 seconds.",
+    );
+    msgId = sentMsg.message_id;
     for (const instrument of ["XAUUSD", "BTCUSD"]) {
       const data = await buildDataBlock(instrument);
       const analysis = await callClaude(
         data.block + `\nFull analysis for $20 account trader.`,
-        SYSTEM_PROMPT,
       );
       await bot.sendMessage(
         chatId,
-        `<b>${instrument}</b>\nConfluence: ${data.confluence.score}/6 | Bias: ${data.confluence.direction || "Neutral"}\n\n${analysis}`,
-        { parse_mode: "HTML" },
+        `${instrument}\nConfluence: ${data.confluence.score}/6 | Bias: ${data.confluence.direction || "Neutral"}\n\n${analysis}`,
       );
     }
-    await bot.deleteMessage(chatId, thinking.message_id);
+    try {
+      await bot.deleteMessage(chatId, msgId);
+    } catch {}
   } catch (err) {
-    await bot.editMessageText(`Error: ${err.message}`, {
-      chat_id: chatId,
-      message_id: thinking.message_id,
-    });
+    console.error("both error:", err.message);
+    try {
+      if (msgId)
+        await bot.editMessageText(`Error: ${err.message.slice(0, 100)}`, {
+          chat_id: chatId,
+          message_id: msgId,
+        });
+    } catch {
+      bot.sendMessage(chatId, "Error occurred. Please try again.");
+    }
   }
 });
 
 bot.onText(/\/refresh/, async (msg) => {
+  if (!botActive) {
+    bot.sendMessage(msg.chat.id, "Bot is stopped. Send /start to reactivate.");
+    return;
+  }
   if (isProcessing(msg.chat.id, "refresh")) return;
   clearCache("XAUUSD");
   clearCache("BTCUSD");
@@ -868,27 +936,40 @@ bot.onText(/\/refresh/, async (msg) => {
 });
 
 bot.onText(/\/confluence/, async (msg) => {
+  if (!botActive) {
+    bot.sendMessage(msg.chat.id, "Bot is stopped. Send /start to reactivate.");
+    return;
+  }
   if (isProcessing(msg.chat.id, "confluence")) return;
-  const thinking = await bot.sendMessage(
-    msg.chat.id,
-    "Calculating confluence...",
-  );
+  let msgId = null;
   try {
-    let text = `<b>Confluence Scores</b>\n\n`;
+    const sentMsg = await bot.sendMessage(
+      msg.chat.id,
+      "Calculating confluence...",
+    );
+    msgId = sentMsg.message_id;
+    let text = `Confluence Scores\n\n`;
     for (const instrument of ["XAUUSD", "BTCUSD"]) {
       const data = await buildDataBlock(instrument);
       const c = data.confluence;
-      text += `<b>${instrument}</b> — ${c.score}/${c.total} | ${c.direction || "NEUTRAL"}\n`;
+      text += `${instrument} - ${c.score}/${c.total} | ${c.direction || "NEUTRAL"}\n`;
       text += c.factors.map((f) => `  ${f}`).join("\n") + "\n\n";
     }
     text += `Threshold: 4+ factors to signal`;
-    await bot.deleteMessage(msg.chat.id, thinking.message_id);
-    await bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
+    try {
+      await bot.deleteMessage(msg.chat.id, msgId);
+    } catch {}
+    await bot.sendMessage(msg.chat.id, text);
   } catch (err) {
-    await bot.editMessageText(`Error: ${err.message}`, {
-      chat_id: msg.chat.id,
-      message_id: thinking.message_id,
-    });
+    try {
+      if (msgId)
+        await bot.editMessageText(`Error: ${err.message.slice(0, 100)}`, {
+          chat_id: msg.chat.id,
+          message_id: msgId,
+        });
+    } catch {
+      bot.sendMessage(msg.chat.id, "Error occurred.");
+    }
   }
 });
 
@@ -897,11 +978,10 @@ bot.onText(/\/credits/, (msg) => {
   const remaining = creditsRemaining();
   const pct = Math.min(100, Math.round((used / DAILY_CREDIT_LIMIT) * 100));
   const bar =
-    "█".repeat(Math.floor(pct / 10)) + "░".repeat(10 - Math.floor(pct / 10));
+    "#".repeat(Math.floor(pct / 10)) + ".".repeat(10 - Math.floor(pct / 10));
   bot.sendMessage(
     msg.chat.id,
-    `<b>API Credits Today</b>\n\n${bar} ${pct}%\nUsed: ${used} / ${DAILY_CREDIT_LIMIT}\nRemaining: ${remaining}\n\nResets: midnight UTC\nCache: data reused 25 mins after fetch`,
-    { parse_mode: "HTML" },
+    `API Credits Today\n\n[${bar}] ${pct}%\nUsed: ${used} / ${DAILY_CREDIT_LIMIT}\nRemaining: ${remaining}\n\nResets: midnight UTC\nCache: data reused 25 mins after fetch`,
   );
 });
 
@@ -909,49 +989,60 @@ bot.onText(/\/session/, (msg) => {
   const s = getSession();
   bot.sendMessage(
     msg.chat.id,
-    `<b>Session</b>\n\n${s.utcStr}\n${s.name}\nOptimal: ${s.isOptimal ? "YES" : "NO"}\n\nLondon: 08:00–17:00 UTC\nNew York: 13:00–22:00 UTC\nBest: 13:00–17:00 UTC overlap`,
-    { parse_mode: "HTML" },
+    `Trading Session\n\n${s.utcStr}\n${s.name}\nOptimal: ${s.isOptimal ? "YES" : "NO"}\n\nLondon: 08:00-17:00 UTC\nNew York: 13:00-22:00 UTC\nBest overlap: 13:00-17:00 UTC`,
   );
 });
 
 bot.onText(/\/calendar/, async (msg) => {
-  const thinking = await bot.sendMessage(msg.chat.id, "Checking calendar...");
+  let msgId = null;
   try {
+    const sentMsg = await bot.sendMessage(msg.chat.id, "Checking calendar...");
+    msgId = sentMsg.message_id;
     const cal = await fetchEconomicEvents();
-    await bot.deleteMessage(msg.chat.id, thinking.message_id);
+    try {
+      await bot.deleteMessage(msg.chat.id, msgId);
+    } catch {}
     await bot.sendMessage(
       msg.chat.id,
-      `<b>Economic Calendar</b>\n\nHigh-impact: ${cal.hasHighImpact ? "YES — avoid trading" : "None"}\n${cal.events}`,
-      { parse_mode: "HTML" },
+      `Economic Calendar\n\nHigh-impact: ${cal.hasHighImpact ? "YES - avoid trading" : "None"}\n${cal.events}`,
     );
   } catch {
-    await bot.editMessageText("Error", {
-      chat_id: msg.chat.id,
-      message_id: thinking.message_id,
-    });
+    try {
+      if (msgId)
+        await bot.editMessageText("Error fetching calendar.", {
+          chat_id: msg.chat.id,
+          message_id: msgId,
+        });
+    } catch {}
   }
 });
 
 bot.onText(/\/feargreed/, async (msg) => {
-  const thinking = await bot.sendMessage(msg.chat.id, "Fetching index...");
+  let msgId = null;
   try {
+    const sentMsg = await bot.sendMessage(msg.chat.id, "Fetching index...");
+    msgId = sentMsg.message_id;
     const fg = await fetchFearGreed();
     const bar =
       fg?.value != null
-        ? "█".repeat(Math.floor(fg.value / 10)) +
-          "░".repeat(10 - Math.floor(fg.value / 10))
-        : "";
-    await bot.deleteMessage(msg.chat.id, thinking.message_id);
+        ? "#".repeat(Math.floor(fg.value / 10)) +
+          ".".repeat(10 - Math.floor(fg.value / 10))
+        : "unavailable";
+    try {
+      await bot.deleteMessage(msg.chat.id, msgId);
+    } catch {}
     await bot.sendMessage(
       msg.chat.id,
-      `<b>Fear & Greed</b>\n\n${bar}\n${fg?.value ?? "n/a"}/100 — <b>${fg?.label ?? "n/a"}</b>\n\n0–24 Extreme Fear\n25–49 Fear\n50–74 Greed\n75–100 Extreme Greed`,
-      { parse_mode: "HTML" },
+      `Fear & Greed Index\n\n[${bar}]\n${fg?.value ?? "n/a"}/100 - ${fg?.label ?? "n/a"}\n\n0-24: Extreme Fear\n25-49: Fear\n50-74: Greed\n75-100: Extreme Greed`,
     );
   } catch {
-    await bot.editMessageText("Error", {
-      chat_id: msg.chat.id,
-      message_id: thinking.message_id,
-    });
+    try {
+      if (msgId)
+        await bot.editMessageText("Error fetching index.", {
+          chat_id: msg.chat.id,
+          message_id: msgId,
+        });
+    } catch {}
   }
 });
 
@@ -967,13 +1058,13 @@ bot.onText(/\/journal/, (msg) => {
   const wr =
     wins + losses > 0 ? ((wins / (wins + losses)) * 100).toFixed(0) : "n/a";
   const recent = journal.slice(-10).reverse();
-  let text = `<b>Journal</b>\n\nTotal: ${journal.length} | W: ${wins} | L: ${losses} | Pending: ${pending}\nWin rate: ${wr}%\n\n`;
+  let text = `Trade Journal\n\nTotal: ${journal.length} | W: ${wins} | L: ${losses} | Pending: ${pending}\nWin rate: ${wr}%\n\nLast 10:\n`;
   recent.forEach((t) => {
     const icon = t.outcome === "win" ? "W" : t.outcome === "loss" ? "L" : "?";
-    text += `[${icon}] #${t.id} ${t.instrument} ${t.signal} ${t.quality || ""} — ${new Date(t.timestamp).toLocaleDateString()}\n`;
+    text += `[${icon}] #${t.id} ${t.instrument} ${t.signal} ${t.quality || ""} - ${new Date(t.timestamp).toLocaleDateString()}\n`;
   });
   text += `\n/win [id] or /loss [id] to update`;
-  bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
+  bot.sendMessage(msg.chat.id, text);
 });
 
 bot.onText(/\/win (.+)/, (msg, match) => {
@@ -998,53 +1089,98 @@ bot.onText(/\/status/, (msg) => {
   const s = getSession();
   bot.sendMessage(
     msg.chat.id,
-    `<b>Status</b>\n\nSession: ${s.name} | ${s.utcStr}\nDrawdown: ${isBotPaused() ? "PAUSED 24H" : `${consecutiveLosses}/3 losses`}\nCredits: ${creditsRemaining()} remaining\nCache entries: ${Object.keys(dataCache).length} active`,
-    { parse_mode: "HTML" },
+    `Bot Status\n\n` +
+      `Bot: ${botActive ? "ACTIVE" : "STOPPED - send /start"}\n` +
+      `Session: ${s.name} | ${s.utcStr}\n` +
+      `Drawdown lock: ${isBotPaused() ? "YES - 24H pause active" : `No (${consecutiveLosses}/3 losses)`}\n` +
+      `Credits: ${creditsRemaining()} remaining today\n` +
+      `Cache: ${Object.keys(dataCache).length} entries active`,
   );
 });
 
 bot.onText(/\/risk/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `<b>Risk Rules — $20</b>\n\n1. Max risk $0.20 (1%) per trade\n2. Min R/R 1:2 always\n3. One trade at a time\n4. No trading during high-impact news\n5. SL = ATR-based or swing structure\n6. Move SL to entry after TP1\n7. 3 losses = 24H pause\n8. 0.01 lots until $100`,
-    { parse_mode: "HTML" },
+    `Risk Rules - $20 Account\n\n` +
+      `1. Max risk $0.20 (1%) per trade\n` +
+      `2. Min R/R 1:2 always\n` +
+      `3. One trade at a time\n` +
+      `4. No trading during high-impact news\n` +
+      `5. SL = ATR-based or swing structure\n` +
+      `6. Move SL to entry after TP1\n` +
+      `7. 3 losses = 24H auto-pause\n` +
+      `8. 0.01 lots until account reaches $100`,
   );
 });
 
 bot.onText(/\/sizing/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `<b>Sizing — $20</b>\n\n0.01 lots always\nXAUUSD: ~$0.10/pip\n2 pip SL = $0.20 (1%)\n\nSL = 1.5x ATR\nTP1 = 2x ATR | TP2 = 3.5x ATR\n\n$20→$100: 0.01 only\n$100+: reassess`,
-    { parse_mode: "HTML" },
+    `Position Sizing - $20 Account\n\n` +
+      `Lot size: 0.01 always\n` +
+      `XAUUSD: approx $0.10 per pip\n` +
+      `2 pip SL = $0.20 risk (1%)\n\n` +
+      `SL = 1.5x ATR\n` +
+      `TP1 = 2x ATR\n` +
+      `TP2 = 3.5x ATR\n\n` +
+      `$20 to $100: 0.01 lots only\n` +
+      `$100+: reassess sizing`,
   );
 });
 
 bot.onText(/\/help/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `<b>Commands</b>\n\n/gold — XAUUSD\n/btc — BTCUSD\n/both — Both\n/refresh — Clear cache\n/confluence — Scores\n/session — Session\n/calendar — Events\n/feargreed — Sentiment\n/credits — API usage\n/journal — Log\n/win [n] | /loss [n]\n/status | /risk | /sizing\n/ask [question]\n/help`,
-    { parse_mode: "HTML" },
+    `Commands\n\n` +
+      `/gold - XAUUSD analysis\n` +
+      `/btc - BTCUSD analysis\n` +
+      `/both - Both markets\n` +
+      `/refresh - Clear cache\n` +
+      `/confluence - Scores\n` +
+      `/session - Session info\n` +
+      `/calendar - Economic events\n` +
+      `/feargreed - BTC sentiment\n` +
+      `/credits - API usage\n` +
+      `/journal - Trade log\n` +
+      `/win [n] | /loss [n] - Log outcome\n` +
+      `/status - Bot status\n` +
+      `/stop - Pause bot\n` +
+      `/resume - Resume bot\n` +
+      `/risk - Risk rules\n` +
+      `/sizing - Position sizing\n` +
+      `/ask [question] - Ask anything\n` +
+      `/help - This menu`,
   );
 });
 
 bot.onText(/\/ask (.+)/, async (msg, match) => {
+  if (!botActive) {
+    bot.sendMessage(msg.chat.id, "Bot is stopped. Send /start to reactivate.");
+    return;
+  }
   if (isProcessing(msg.chat.id, "ask")) return;
   const chatId = msg.chat.id;
-  const thinking = await bot.sendMessage(chatId, "Analyzing...");
+  let msgId = null;
   try {
+    const sentMsg = await bot.sendMessage(chatId, "Analyzing...");
+    msgId = sentMsg.message_id;
     const answer = await callClaude(
       `$20 account, 30M/1H trader. Question: ${match[1]}`,
-      SYSTEM_PROMPT,
     );
-    await bot.deleteMessage(chatId, thinking.message_id);
-    await bot.sendMessage(chatId, `<b>Answer</b>\n\n${answer}`, {
-      parse_mode: "HTML",
-    });
+    try {
+      await bot.deleteMessage(chatId, msgId);
+    } catch {}
+    await bot.sendMessage(chatId, `Answer\n\n${answer}`);
   } catch (err) {
-    await bot.editMessageText(`Error: ${err.message}`, {
-      chat_id: chatId,
-      message_id: thinking.message_id,
-    });
+    try {
+      if (msgId)
+        await bot.editMessageText(`Error: ${err.message.slice(0, 100)}`, {
+          chat_id: chatId,
+          message_id: msgId,
+        });
+    } catch {
+      bot.sendMessage(chatId, "Error occurred. Please try again.");
+    }
   }
 });
 
@@ -1053,10 +1189,10 @@ bot.on("message", (msg) => {
     bot.sendMessage(msg.chat.id, "Type /help for all commands.");
 });
 
-console.log(`\nTradingBot Pro — ${new Date().toISOString()}`);
+console.log(`\nTradingBot Pro - ${new Date().toISOString()}`);
 console.log(`Chat IDs: ${ALERT_CHAT_IDS.join(", ") || "NONE SET"}`);
 console.log(
   `Credits today: ${loadCredits().used} used / ${DAILY_CREDIT_LIMIT} limit`,
 );
-console.log(`Mode: Manual only — no automatic scanning`);
+console.log(`Mode: Manual only - no automatic scanning`);
 console.log(`Cache TTL: 25 minutes\n`);
