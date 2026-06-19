@@ -35,34 +35,8 @@ function isProcessing(chatId, command) {
   return false;
 }
 
-// ─── HTML Sanitizer ───────────────────────────────────────────────────────────
-function sanitizeHTML(text) {
-  return text
-    .replace(
-      /<(?!\/?b>|\/?strong>|\/?i>|\/?em>|\/?code>|\/?pre>|\/?a[\s>])[^>]*>/gi,
-      "",
-    )
-    .replace(/&(?!amp;|lt;|gt;|quot;|#\d+;)/g, "&amp;");
-}
-
-// ─── Safe Send ────────────────────────────────────────────────────────────────
-async function safeSend(chatId, text, options = {}) {
-  try {
-    await bot.sendMessage(chatId, sanitizeHTML(text), {
-      parse_mode: "HTML",
-      ...options,
-    });
-  } catch (err) {
-    console.error("safeSend error:", err.message);
-    // Fallback: send without HTML parsing
-    try {
-      const plain = text.replace(/<[^>]*>/g, "").replace(/&amp;/g, "&");
-      await bot.sendMessage(chatId, plain);
-    } catch (e) {
-      console.error("safeSend fallback failed:", e.message);
-    }
-  }
-}
+// ─── Delay Helper ─────────────────────────────────────────────────────────────
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─── Credit Tracker ───────────────────────────────────────────────────────────
 const CREDIT_FILE = path.join(__dirname, "credits.json");
@@ -104,28 +78,22 @@ function hasCredits(needed = 1) {
   return creditsRemaining() >= needed;
 }
 
-function checkCreditReset() {
+// Startup reset
+(function checkCreditReset() {
   const today = new Date().toISOString().split("T")[0];
   try {
+    let used = 0;
     if (fs.existsSync(CREDIT_FILE)) {
-      const data = JSON.parse(fs.readFileSync(CREDIT_FILE, "utf8"));
-      if (data.date !== today) {
-        fs.writeFileSync(CREDIT_FILE, JSON.stringify({ date: today, used: 0 }));
-        console.log("Credits reset for new day");
-      }
-    } else {
-      fs.writeFileSync(CREDIT_FILE, JSON.stringify({ date: today, used: 0 }));
-      console.log("Credits file created fresh");
+      const existing = JSON.parse(fs.readFileSync(CREDIT_FILE, "utf8"));
+      if (existing.date === today) used = existing.used || 0;
     }
+    fs.writeFileSync(CREDIT_FILE, JSON.stringify({ date: today, used }));
   } catch (err) {
     try {
       fs.writeFileSync(CREDIT_FILE, JSON.stringify({ date: today, used: 0 }));
     } catch {}
-    console.log("Credits reset after error:", err.message);
   }
-}
-
-checkCreditReset();
+})();
 
 // ─── Data Cache (25 min TTL) ──────────────────────────────────────────────────
 const dataCache = {};
@@ -252,9 +220,6 @@ function getSession() {
   };
 }
 
-// ─── Delay Helper ─────────────────────────────────────────────────────────────
-const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-
 // ─── Twelve Data Fetcher ──────────────────────────────────────────────────────
 async function tdFetch(endpoint, params, cacheKey) {
   const cached = getCached(cacheKey);
@@ -270,7 +235,7 @@ async function tdFetch(endpoint, params, cacheKey) {
     const url = `https://api.twelvedata.com/${endpoint}?${params}&apikey=${PRICE_API_KEY}`;
     const res = await axios.get(url, { timeout: 20000 });
     if (res.data.code === 429) {
-      console.log("429 from Twelve Data — limit hit, waiting...");
+      console.log("429 rate limit — skipping");
       return null;
     }
     if (res.data.code) {
@@ -286,7 +251,7 @@ async function tdFetch(endpoint, params, cacheKey) {
   }
 }
 
-// ─── Fetchers ─────────────────────────────────────────────────────────────────
+// ─── Fetchers (max 8 TD calls per analysis) ───────────────────────────────────
 async function fetchPrice(symbol) {
   try {
     if (symbol === "BTCUSD") {
@@ -314,7 +279,6 @@ async function fetchRSI(symbol, interval) {
     `symbol=${sym}&interval=${interval}&time_period=14&outputsize=1`,
     `rsi_${symbol}_${interval}`,
   );
-  await delay(300);
   return data?.values?.[0] ? parseFloat(data.values[0].rsi).toFixed(2) : null;
 }
 
@@ -325,47 +289,16 @@ async function fetchMA(symbol, period, interval) {
     `symbol=${sym}&interval=${interval}&time_period=${period}&outputsize=1`,
     `ma${period}_${symbol}_${interval}`,
   );
-  await delay(300);
   return data?.values?.[0] ? parseFloat(data.values[0].ma).toFixed(2) : null;
 }
 
-async function fetchATR(symbol, interval) {
-  const sym = symbol === "XAUUSD" ? "XAU%2FUSD" : "BTC%2FUSD";
-  const data = await tdFetch(
-    "atr",
-    `symbol=${sym}&interval=${interval}&time_period=14&outputsize=1`,
-    `atr_${symbol}_${interval}`,
-  );
-  await delay(300);
-  return data?.values?.[0] ? parseFloat(data.values[0].atr).toFixed(2) : null;
-}
-
-async function fetchMACD(symbol, interval) {
-  const sym = symbol === "XAUUSD" ? "XAU%2FUSD" : "BTC%2FUSD";
-  const data = await tdFetch(
-    "macd",
-    `symbol=${sym}&interval=${interval}&fast_period=12&slow_period=26&signal_period=9&outputsize=1`,
-    `macd_${symbol}_${interval}`,
-  );
-  await delay(300);
-  if (data?.values?.[0]) {
-    return {
-      macd: parseFloat(data.values[0].macd).toFixed(4),
-      signal: parseFloat(data.values[0].macd_signal).toFixed(4),
-      histogram: parseFloat(data.values[0].macd_hist).toFixed(4),
-    };
-  }
-  return null;
-}
-
-async function fetchCandles(symbol, interval, count = 8) {
+async function fetchCandles(symbol, interval, count = 10) {
   const sym = symbol === "XAUUSD" ? "XAU%2FUSD" : "BTC%2FUSD";
   const data = await tdFetch(
     "time_series",
     `symbol=${sym}&interval=${interval}&outputsize=${count}`,
     `candles_${symbol}_${interval}_${count}`,
   );
-  await delay(300);
   if (data?.values?.length > 0) {
     return data.values.map((c) => ({
       time: c.datetime,
@@ -470,7 +403,7 @@ async function fetchEconomicEvents() {
 
 // ─── Confluence Scorer ────────────────────────────────────────────────────────
 function scoreConfluence(data) {
-  const { price, rsi1h, rsi4h, ma20_1h, ma50_1h, macd1h } = data;
+  const { price, rsi1h, rsi4h, ma20_1h, ma50_1h } = data;
   if (!price)
     return {
       score: 0,
@@ -523,16 +456,6 @@ function scoreConfluence(data) {
       factors.push(`RSI 4H bearish (${r})`);
     }
   }
-  if (macd1h) {
-    const h = parseFloat(macd1h.histogram);
-    if (h > 0) {
-      bullish++;
-      factors.push(`MACD bullish (${macd1h.histogram})`);
-    } else {
-      bearish++;
-      factors.push(`MACD bearish (${macd1h.histogram})`);
-    }
-  }
   if (ma20_1h && ma50_1h) {
     if (parseFloat(ma20_1h) > parseFloat(ma50_1h)) {
       bullish++;
@@ -555,99 +478,130 @@ function scoreConfluence(data) {
   };
 }
 
-// ─── Build Data Block ─────────────────────────────────────────────────────────
+// ─── Build Data Block (max 8 TD calls) ───────────────────────────────────────
 async function buildDataBlock(instrument, forceRefresh = false) {
   if (forceRefresh) clearCache(instrument);
   console.log(
     `Building data for ${instrument} (credits: ${creditsRemaining()})...`,
   );
 
+  // Call 1 — price (CoinGecko for BTC, TD for gold)
   const price = await fetchPrice(instrument);
-  await delay(400);
+  await delay(1000);
+
+  // Call 2 — RSI 4H
   const rsi4h = await fetchRSI(instrument, "4h");
-  await delay(400);
+  await delay(1000);
+
+  // Call 3 — RSI 1H
   const rsi1h = await fetchRSI(instrument, "1h");
-  await delay(400);
+  await delay(1000);
+
+  // Call 4 — RSI 30M
   const rsi30m = await fetchRSI(instrument, "30min");
-  await delay(400);
+  await delay(1000);
+
+  // Call 5 — MA20 1H
   const ma20_1h = await fetchMA(instrument, 20, "1h");
-  await delay(400);
+  await delay(1000);
+
+  // Call 6 — MA50 1H
   const ma50_1h = await fetchMA(instrument, 50, "1h");
-  await delay(400);
-  const ma20_4h = await fetchMA(instrument, 20, "4h");
-  await delay(400);
-  const ma50_4h = await fetchMA(instrument, 50, "4h");
-  await delay(400);
-  const atr1h = await fetchATR(instrument, "1h");
-  await delay(400);
-  const macd1h = await fetchMACD(instrument, "1h");
-  await delay(400);
-  const candles1h = await fetchCandles(instrument, "1h", 8);
-  await delay(400);
-  const candles30m = await fetchCandles(instrument, "30min", 8);
+  await delay(1000);
+
+  // Call 7 — 1H candles (10 candles = price action + S/R + patterns)
+  const candles1h = await fetchCandles(instrument, "1h", 10);
+  await delay(1000);
+
+  // Call 8 — 30M candles (entry timing)
+  const candles30m = await fetchCandles(instrument, "30min", 10);
+
+  // Free calls — no TD credits used
   const news = await fetchNews(instrument);
   const fearGreed = instrument === "BTCUSD" ? await fetchFearGreed() : null;
   const calendar = await fetchEconomicEvents();
   const session = getSession();
 
-  const confluence = scoreConfluence({
-    price,
-    rsi1h,
-    rsi4h,
-    ma20_1h,
-    ma50_1h,
-    macd1h,
-  });
+  // ATR and MACD dropped — Claude calculates from candle data instead
+  // This keeps us at exactly 8 TD calls per analysis
+
+  const confluence = scoreConfluence({ price, rsi1h, rsi4h, ma20_1h, ma50_1h });
   const p = price ? parseFloat(price) : 0;
-  const atrVal = atr1h ? parseFloat(atr1h) : null;
+
+  // Manual ATR estimate from candles (average candle range)
+  let atrEstimate = null;
+  if (candles1h && candles1h.length >= 5) {
+    const ranges = candles1h
+      .slice(0, 5)
+      .map((c) => parseFloat(c.high) - parseFloat(c.low));
+    atrEstimate = (ranges.reduce((a, b) => a + b, 0) / ranges.length).toFixed(
+      2,
+    );
+  }
 
   const levels = {
-    sl_buy: atrVal ? (p - atrVal * 1.5).toFixed(2) : null,
-    tp1_buy: atrVal ? (p + atrVal * 2.0).toFixed(2) : null,
-    tp2_buy: atrVal ? (p + atrVal * 3.5).toFixed(2) : null,
-    sl_sell: atrVal ? (p + atrVal * 1.5).toFixed(2) : null,
-    tp1_sell: atrVal ? (p - atrVal * 2.0).toFixed(2) : null,
-    tp2_sell: atrVal ? (p - atrVal * 3.5).toFixed(2) : null,
+    sl_buy: atrEstimate ? (p - parseFloat(atrEstimate) * 1.5).toFixed(2) : null,
+    tp1_buy: atrEstimate
+      ? (p + parseFloat(atrEstimate) * 2.0).toFixed(2)
+      : null,
+    tp2_buy: atrEstimate
+      ? (p + parseFloat(atrEstimate) * 3.5).toFixed(2)
+      : null,
+    sl_sell: atrEstimate
+      ? (p + parseFloat(atrEstimate) * 1.5).toFixed(2)
+      : null,
+    tp1_sell: atrEstimate
+      ? (p - parseFloat(atrEstimate) * 2.0).toFixed(2)
+      : null,
+    tp2_sell: atrEstimate
+      ? (p - parseFloat(atrEstimate) * 3.5).toFixed(2)
+      : null,
   };
 
   let block = `=== ${instrument} MARKET DATA ===\n`;
   block += `Price: $${price ? parseFloat(price).toLocaleString() : "unavailable"}\n`;
   block += `Session: ${session.name} | ${session.utcStr}\n`;
   block += `High-impact news: ${calendar.hasHighImpact ? "YES — " + calendar.events : "None"}\n\n`;
+
   block += `--- CONFLUENCE (${confluence.score}/${confluence.total} | ${confluence.direction || "NEUTRAL"}) ---\n`;
   block += confluence.factors.map((f) => `  ${f}`).join("\n") + "\n\n";
+
   block += `--- INDICATORS ---\n`;
-  block += `ATR(14,1H): ${atr1h || "n/a"}\n`;
-  if (atrVal) {
+  block += `ATR estimate (avg 5-candle range, 1H): ${atrEstimate || "n/a"}\n`;
+  if (atrEstimate) {
     block += `BUY:  SL $${levels.sl_buy} | TP1 $${levels.tp1_buy} | TP2 $${levels.tp2_buy}\n`;
     block += `SELL: SL $${levels.sl_sell} | TP1 $${levels.tp1_sell} | TP2 $${levels.tp2_sell}\n`;
   }
-  if (macd1h)
-    block += `MACD: ${macd1h.macd} | Signal: ${macd1h.signal} | Hist: ${macd1h.histogram}\n`;
-  block += `\n--- 4H TREND ---\n`;
-  block += `RSI: ${rsi4h || "n/a"} | MA20: ${ma20_4h ? "$" + ma20_4h : "n/a"} | MA50: ${ma50_4h ? "$" + ma50_4h : "n/a"}\n\n`;
-  block += `--- 1H CHART ---\n`;
-  block += `RSI: ${rsi1h || "n/a"} | MA20: ${ma20_1h ? "$" + ma20_1h : "n/a"} | MA50: ${ma50_1h ? "$" + ma50_1h : "n/a"}\n`;
+  block += `RSI 4H: ${rsi4h || "n/a"}\n`;
+  block += `RSI 1H: ${rsi1h || "n/a"}\n`;
+  block += `RSI 30M: ${rsi30m || "n/a"}\n`;
+  block += `MA20 1H: ${ma20_1h ? "$" + ma20_1h : "n/a"}\n`;
+  block += `MA50 1H: ${ma50_1h ? "$" + ma50_1h : "n/a"}\n\n`;
+
+  block += `--- 1H CANDLES (O/H/L/C) ---\n`;
   if (candles1h) {
-    block += `Candles (O/H/L/C):\n`;
     candles1h.forEach((c) => {
       block += `  ${c.time}: ${c.open}/${c.high}/${c.low}/${c.close}\n`;
     });
+  } else {
+    block += `  Unavailable\n`;
   }
-  block += `\n--- 30M CHART ---\n`;
-  block += `RSI: ${rsi30m || "n/a"}\n`;
+
+  block += `\n--- 30M CANDLES (O/H/L/C) ---\n`;
   if (candles30m) {
-    block += `Candles (O/H/L/C):\n`;
     candles30m.forEach((c) => {
       block += `  ${c.time}: ${c.open}/${c.high}/${c.low}/${c.close}\n`;
     });
+  } else {
+    block += `  Unavailable\n`;
   }
+
   block += `\n`;
   if (fearGreed)
     block += `--- SENTIMENT ---\nFear & Greed: ${fearGreed.value}/100 — ${fearGreed.label}\n\n`;
   block += `--- NEWS ---\n${news || "No news — analysis based on price action only."}\n`;
 
-  return { block, price, session, calendar, confluence, atr: atr1h, levels };
+  return { block, price, session, calendar, confluence, atrEstimate, levels };
 }
 
 // ─── System Prompt ────────────────────────────────────────────────────────────
@@ -657,50 +611,47 @@ PHILOSOPHY:
 - Price action and structure first. Indicators confirm, they do not lead.
 - No news is fine — candlestick patterns and S/R levels are sufficient.
 - Confluence of 4+ factors required. Below that, NO TRADE.
-- Never guess. Every level must come from the candle data provided.
-- Protecting $20 capital is the absolute priority.
+- Every level must come from the candle data provided. Never guess.
+- Protecting the $20 account is the absolute priority.
 
 ACCOUNT RULES:
 - Risk: 1% = $0.20 max | Lot: 0.01 only | Min R/R: 1:2
-- SL: ATR-based if available, otherwise nearest swing high/low
-- Timeframe: 4H trend, 1H confirmation, 30M entry
+- SL: use ATR estimate provided, or nearest swing high/low from candles
+- Timeframe hierarchy: 4H trend, 1H confirmation, 30M entry
 
-PRICE ACTION TO APPLY:
-- S/R from swing highs/lows in candle data
-- Patterns: engulfing, pin bar, inside bar, doji, hammer, shooting star
+PRICE ACTION TECHNIQUES:
+- Support and resistance from swing highs/lows in the candle data
+- Candlestick patterns: engulfing, pin bar, inside bar, doji, hammer, shooting star
 - Break and retest of key levels
-- Higher highs/lower lows structure
-- MA crossover and price rejection at MA levels
-- MACD crossover and histogram direction
+- Higher highs/lower lows trend structure
+- Price rejection at MA levels
 - RSI divergence across timeframes
 
-OUTPUT FORMAT — use exactly this, no markdown symbols, no asterisks, no angle brackets:
+OUTPUT FORMAT — no markdown, no asterisks, no HTML tags, plain text only:
 
 INSTRUMENT: [XAUUSD or BTCUSD]
 SIGNAL: [BUY / SELL / NO TRADE]
 TIMEFRAME: [30M / 1H]
-CONFLUENCE: [X/6]
+CONFLUENCE: [X/5]
 
-ENTRY: [price]
-STOP LOSS: [price] - [reason]
-TAKE PROFIT 1: [price] - [R/R]
-TAKE PROFIT 2: [price] - [R/R]
-LOT SIZE: 0.01 - $0.20 risk
+ENTRY: [exact price]
+STOP LOSS: [price] - [reason from candle data]
+TAKE PROFIT 1: [price] - [R/R ratio]
+TAKE PROFIT 2: [price] - [R/R ratio]
+LOT SIZE: 0.01 - $0.20 risk on $20 account
 
-4H STRUCTURE: [brief]
-1H STRUCTURE: [brief]
-30M STRUCTURE: [brief]
-PATTERN: [name or none]
-MACD: [bullish / bearish / neutral]
-RSI: [key observation]
-KEY S/R: [levels from candle data]
+4H STRUCTURE: [bullish/bearish/ranging + brief reason]
+1H STRUCTURE: [bullish/bearish/ranging + brief reason]
+30M STRUCTURE: [bullish/bearish/ranging + brief reason]
+PATTERN: [pattern name and candle, or none]
+RSI NOTE: [key observation across timeframes]
+KEY S/R: [exact levels from candle highs/lows]
 
 CONFIDENCE: [Low / Medium / High]
 SETUP QUALITY: [A / B / C]
-REASONING: [3 sentences - precise and technical]
+REASONING: [3 sentences - precise, technical, no vague language]
 
-IMPORTANT: Do not use any HTML tags, markdown, asterisks, or angle brackets in your response.
-If NO TRADE: state what is missing and what price action must occur first.`;
+If NO TRADE: state exactly what confluence is missing and what price level to watch for entry.`;
 
 // ─── Claude API ───────────────────────────────────────────────────────────────
 async function callClaude(userMessage, retries = 2) {
@@ -725,6 +676,10 @@ async function callClaude(userMessage, retries = 2) {
       );
       return res.data.content[0].text;
     } catch (err) {
+      // Log the full error response so we can see exactly what's wrong
+      if (err.response?.data) {
+        console.log(`Claude error detail:`, JSON.stringify(err.response.data));
+      }
       console.log(`Claude attempt ${attempt} failed: ${err.message}`);
       if (attempt < retries) await delay(3000);
       else throw err;
@@ -756,17 +711,16 @@ async function runAnalysis(chatId, instrument, forceRefresh = false) {
   if (isBotPaused()) {
     bot.sendMessage(
       chatId,
-      "Bot paused — 3 consecutive losses hit. Resumes in 24 hours. Use /journal to review.",
+      "Bot paused — 3 losses hit. Resumes in 24 hours. Use /journal to review.",
     );
     return;
   }
 
   let msgId = null;
-
   try {
     const sentMsg = await bot.sendMessage(
       chatId,
-      `Analyzing ${instrument}...\nFetching live data (15-25 seconds).\nCredits remaining: ${creditsRemaining()}`,
+      `Analyzing ${instrument}...\nFetching data — 8 API calls with 1s delay each.\nEstimated time: 20-25 seconds.\nCredits remaining: ${creditsRemaining()}`,
     );
     msgId = sentMsg.message_id;
 
@@ -782,12 +736,11 @@ async function runAnalysis(chatId, instrument, forceRefresh = false) {
       (data.calendar.hasHighImpact
         ? `NEWS RISK: High-impact event active\n`
         : "") +
-      `Credits used: ${loadCredits().used}/${DAILY_CREDIT_LIMIT}\n\n`;
+      `Credits used today: ${loadCredits().used}/${DAILY_CREDIT_LIMIT}\n\n`;
 
     try {
       await bot.deleteMessage(chatId, msgId);
     } catch {}
-
     await bot.sendMessage(chatId, header + analysis);
 
     logSignal({
@@ -806,14 +759,12 @@ async function runAnalysis(chatId, instrument, forceRefresh = false) {
   } catch (err) {
     console.error("runAnalysis error:", err.message);
     try {
-      if (msgId) {
+      if (msgId)
         await bot.editMessageText(`Error: ${err.message.slice(0, 100)}`, {
           chat_id: chatId,
           message_id: msgId,
         });
-      } else {
-        await bot.sendMessage(chatId, `Error occurred. Please try again.`);
-      }
+      else await bot.sendMessage(chatId, "Error occurred. Please try again.");
     } catch {
       bot.sendMessage(chatId, "Error occurred. Please try again.");
     }
@@ -831,22 +782,21 @@ bot.onText(/\/start/, (msg) => {
       `/gold - Analyze XAUUSD\n` +
       `/btc - Analyze BTCUSD\n` +
       `/both - Analyze both markets\n` +
-      `/refresh - Force fresh data fetch\n` +
+      `/refresh - Force fresh data\n` +
       `/confluence - Live confluence scores\n\n` +
       `INFO COMMANDS:\n` +
-      `/session - Current trading session\n` +
-      `/calendar - Economic events today\n` +
-      `/feargreed - BTC Fear & Greed index\n` +
+      `/session - Current session\n` +
+      `/calendar - Economic events\n` +
+      `/feargreed - BTC Fear & Greed\n` +
       `/credits - API usage today\n\n` +
-      `JOURNAL COMMANDS:\n` +
-      `/journal - Trade history and win rate\n` +
-      `/win [n] - Mark trade as win\n` +
-      `/loss [n] - Mark trade as loss\n\n` +
+      `JOURNAL:\n` +
+      `/journal - Trade history\n` +
+      `/win [n] - Mark win\n` +
+      `/loss [n] - Mark loss\n\n` +
       `BOT CONTROLS:\n` +
       `/stop - Pause bot\n` +
       `/resume - Resume bot\n` +
       `/status - Bot status\n\n` +
-      `OTHER:\n` +
       `/risk - Risk rules\n` +
       `/sizing - Position sizing\n` +
       `/ask [question] - Ask anything\n` +
@@ -858,7 +808,7 @@ bot.onText(/\/stop/, (msg) => {
   botActive = false;
   bot.sendMessage(
     msg.chat.id,
-    `Bot Paused\n\nAll analysis commands disabled.\nNo API calls will be made.\n\nSend /resume to reactivate.`,
+    `Bot Paused\n\nAll commands disabled. No API calls.\n\nSend /resume to reactivate.`,
   );
 });
 
@@ -866,7 +816,7 @@ bot.onText(/\/resume/, (msg) => {
   botActive = true;
   bot.sendMessage(
     msg.chat.id,
-    `Bot Resumed\n\nBot is active again.\nCredits remaining: ${creditsRemaining()}\n\nSend /gold or /btc to get an analysis.`,
+    `Bot Resumed\n\nActive again. Credits remaining: ${creditsRemaining()}\n\nSend /gold or /btc to analyze.`,
   );
 });
 
@@ -891,7 +841,7 @@ bot.onText(/\/both/, async (msg) => {
   try {
     const sentMsg = await bot.sendMessage(
       chatId,
-      "Analyzing both markets...\nPlease wait 30-40 seconds.",
+      "Analyzing both markets...\nEstimated time: 50-60 seconds.",
     );
     msgId = sentMsg.message_id;
     for (const instrument of ["XAUUSD", "BTCUSD"]) {
@@ -901,8 +851,9 @@ bot.onText(/\/both/, async (msg) => {
       );
       await bot.sendMessage(
         chatId,
-        `${instrument}\nConfluence: ${data.confluence.score}/6 | Bias: ${data.confluence.direction || "Neutral"}\n\n${analysis}`,
+        `${instrument}\nConfluence: ${data.confluence.score}/5 | Bias: ${data.confluence.direction || "Neutral"}\n\n${analysis}`,
       );
+      await delay(5000); // pause between instruments
     }
     try {
       await bot.deleteMessage(chatId, msgId);
@@ -945,7 +896,7 @@ bot.onText(/\/confluence/, async (msg) => {
   try {
     const sentMsg = await bot.sendMessage(
       msg.chat.id,
-      "Calculating confluence...",
+      "Calculating confluence scores...",
     );
     msgId = sentMsg.message_id;
     let text = `Confluence Scores\n\n`;
@@ -955,7 +906,7 @@ bot.onText(/\/confluence/, async (msg) => {
       text += `${instrument} - ${c.score}/${c.total} | ${c.direction || "NEUTRAL"}\n`;
       text += c.factors.map((f) => `  ${f}`).join("\n") + "\n\n";
     }
-    text += `Threshold: 4+ factors to signal`;
+    text += `Threshold: 4+ factors required to signal`;
     try {
       await bot.deleteMessage(msg.chat.id, msgId);
     } catch {}
@@ -981,7 +932,7 @@ bot.onText(/\/credits/, (msg) => {
     "#".repeat(Math.floor(pct / 10)) + ".".repeat(10 - Math.floor(pct / 10));
   bot.sendMessage(
     msg.chat.id,
-    `API Credits Today\n\n[${bar}] ${pct}%\nUsed: ${used} / ${DAILY_CREDIT_LIMIT}\nRemaining: ${remaining}\n\nResets: midnight UTC\nCache: data reused 25 mins after fetch`,
+    `API Credits Today\n\n[${bar}] ${pct}%\nUsed: ${used} / ${DAILY_CREDIT_LIMIT}\nRemaining: ${remaining}\n\nEach analysis uses 8 credits.\nCache reuses data for 25 mins.\nResets: midnight UTC`,
   );
 });
 
@@ -1038,7 +989,7 @@ bot.onText(/\/feargreed/, async (msg) => {
   } catch {
     try {
       if (msgId)
-        await bot.editMessageText("Error fetching index.", {
+        await bot.editMessageText("Error.", {
           chat_id: msg.chat.id,
           message_id: msgId,
         });
@@ -1094,7 +1045,8 @@ bot.onText(/\/status/, (msg) => {
       `Session: ${s.name} | ${s.utcStr}\n` +
       `Drawdown lock: ${isBotPaused() ? "YES - 24H pause active" : `No (${consecutiveLosses}/3 losses)`}\n` +
       `Credits: ${creditsRemaining()} remaining today\n` +
-      `Cache: ${Object.keys(dataCache).length} entries active`,
+      `Cache entries: ${Object.keys(dataCache).length} active\n` +
+      `Calls per analysis: 8 (rate limit safe)`,
   );
 });
 
@@ -1106,7 +1058,7 @@ bot.onText(/\/risk/, (msg) => {
       `2. Min R/R 1:2 always\n` +
       `3. One trade at a time\n` +
       `4. No trading during high-impact news\n` +
-      `5. SL = ATR-based or swing structure\n` +
+      `5. SL = ATR estimate or nearest swing\n` +
       `6. Move SL to entry after TP1\n` +
       `7. 3 losses = 24H auto-pause\n` +
       `8. 0.01 lots until account reaches $100`,
@@ -1120,9 +1072,8 @@ bot.onText(/\/sizing/, (msg) => {
       `Lot size: 0.01 always\n` +
       `XAUUSD: approx $0.10 per pip\n` +
       `2 pip SL = $0.20 risk (1%)\n\n` +
-      `SL = 1.5x ATR\n` +
-      `TP1 = 2x ATR\n` +
-      `TP2 = 3.5x ATR\n\n` +
+      `SL = 1.5x ATR estimate\n` +
+      `TP1 = 2x ATR | TP2 = 3.5x ATR\n\n` +
       `$20 to $100: 0.01 lots only\n` +
       `$100+: reassess sizing`,
   );
@@ -1195,4 +1146,5 @@ console.log(
   `Credits today: ${loadCredits().used} used / ${DAILY_CREDIT_LIMIT} limit`,
 );
 console.log(`Mode: Manual only - no automatic scanning`);
-console.log(`Cache TTL: 25 minutes\n`);
+console.log(`Cache TTL: 25 minutes`);
+console.log(`API calls per analysis: 8 (within free tier rate limit)\n`);
