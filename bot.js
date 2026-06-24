@@ -193,10 +193,8 @@ function recordWin() {
 
 // ─── Auto Reconnect ───────────────────────────────────────────────────────────
 bot.on("polling_error", (err) => {
-  if (err.code === "EFATAL") {
-    console.log("Network drop — reconnecting in 5 seconds...");
-    setTimeout(() => bot.startPolling(), 5000);
-  }
+  console.log("Polling error:", err.code, err.message);
+  // Do not attempt manual reconnect — node-telegram-bot-api handles it internally
 });
 
 // ─── Session Checker ──────────────────────────────────────────────────────────
