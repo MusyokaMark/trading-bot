@@ -999,58 +999,25 @@ async function buildDataBlock(instrument, forceRefresh = false) {
 // This tells Claude exactly how to think and what to output.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a professional trader who specializes in Smart Money Concepts (SMC) and ICT methodology. You analyze markets for a $20 account trader.
+const SYSTEM_PROMPT = `You are a professional trader analyzing setups for a $20 account.
 
-YOUR APPROACH:
-- Price action and market structure come first. Indicators only confirm.
-- SMC signals (BOS, CHoCH, Order Blocks, FVG) carry more weight than RSI or MA alone.
-- You need confluence of 4+ factors before signaling a trade.
-- If the setup is not clean, you say NO TRADE. Protecting capital is always the priority.
-- You never guess. Every level you state must come from the candle data provided.
+RULES:
+- Need 4+ confluence factors to signal a trade
+- Risk 1% = $0.20 | Lot 0.01 only | Min R/R 1:2
+- No trade during high-impact news
+- Every level must come from the candle data
 
-ACCOUNT RULES:
-- Account size: $20 | Risk per trade: 1% = $0.20 | Lot size: 0.01 only
-- Minimum R/R: 1:2 | Maximum 1 open trade at a time
-- Stop loss is based on ATR or nearest swing high/low
-- No trading during high-impact news events
-
-SMC CONCEPTS TO APPLY:
-- Break of Structure (BOS): confirms trend continuation
-- Change of Character (CHoCH): first sign of reversal — high priority signal
-- Order Blocks: institutional supply/demand zones — best entries
-- Fair Value Gaps: price imbalances that attract price back
-- Swing highs/lows: key S/R levels from the candle data
-
-OUTPUT FORMAT — plain text only, no markdown, no asterisks, no symbols:
+OUTPUT FORMAT — keep it short, plain text, no symbols:
 
 INSTRUMENT: [XAUUSD or BTCUSD]
 SIGNAL: [BUY / SELL / NO TRADE]
-TIMEFRAME: [30M / 1H]
-CONFLUENCE: [X/8 factors]
+ENTRY: [price]
+STOP LOSS: [price]
+TAKE PROFIT 1: [price]
+TAKE PROFIT 2: [price]
+REASON: [one sentence — the main technical reason]
 
-ENTRY: [exact price]
-STOP LOSS: [price] - [reason]
-TAKE PROFIT 1: [price] - [R/R]
-TAKE PROFIT 2: [price] - [R/R]
-LOT SIZE: 0.01 — $0.20 risk on $20 account
-
-SMC CONTEXT:
-Market structure: [bullish/bearish/ranging]
-Key SMC level: [most important OB or FVG to watch]
-BOS/CHoCH: [what occurred and what it means]
-
-4H STRUCTURE: [brief]
-1H STRUCTURE: [brief]
-30M STRUCTURE: [brief]
-PATTERN: [candlestick pattern detected or none]
-RSI: [key observation]
-KEY S/R: [levels from candle data]
-
-CONFIDENCE: [Low / Medium / High]
-SETUP QUALITY: [A / B / C]
-REASONING: [3 sentences — precise and technical]
-
-If NO TRADE: state exactly what SMC confirmation is missing and what level to watch for entry.`;
+If NO TRADE: one sentence on what to wait for.`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLAUDE API
@@ -1174,11 +1141,9 @@ async function scanMarket(instrument) {
     lastAutoAlert[instrument] = Date.now();
 
     await broadcast(
-      `TRADE ALERT — ${instrument}\n` +
-        `${data.confluence.direction} | Confluence: ${data.confluence.score}/${data.confluence.total} | SMC: ${data.smc?.bias || "n/a"}\n` +
-        `Session: ${session.name}\n\n` +
+      `SIGNAL — ${instrument} | ${session.name}\n\n` +
         `${analysis}\n\n` +
-        `Signal #${signalId} — use /win ${signalId} or /loss ${signalId} to log outcome.`,
+        `Log: /win ${signalId} or /loss ${signalId}`,
     );
 
     console.log(`Scanner: alert sent for ${instrument}`);
@@ -1258,14 +1223,11 @@ async function runAnalysis(chatId, instrument, forceRefresh = false) {
     );
 
     const header =
-      `${instrument} — ANALYSIS\n` +
-      `Session: ${data.session.name} | ${data.session.utcStr}\n` +
-      `Confluence: ${data.confluence.score}/${data.confluence.total} | Bias: ${data.confluence.direction || "Neutral"}\n` +
-      `SMC: ${data.smc?.bias || "Neutral"} | BOS: ${data.smc?.bos?.hasBOS ? data.smc.bos.type : "None"} | CHoCH: ${data.smc?.choch?.hasCHOCH ? data.smc.choch.type : "None"}\n` +
+      `${instrument} | ${data.session.name} | ${data.session.utcStr}\n` +
       (data.calendar.hasHighImpact
         ? `NEWS RISK: ${data.calendar.events}\n`
         : "") +
-      `Credits used: ${loadCredits().used}/${DAILY_LIMIT}\n\n`;
+      `\n`;
 
     try {
       await bot.deleteMessage(chatId, msgId);
