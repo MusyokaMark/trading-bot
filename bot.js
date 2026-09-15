@@ -13,16 +13,18 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const PRICE_API_KEY = process.env.TWELVE_DATA_API_KEY;
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
-const ALERT_CHAT_IDS = (process.env.ALERT_CHAT_IDS || "")
-  .split(",")
-  .filter(Boolean);
+const INSTRUMENTS = {
+  XAUUSD: { name: "Gold", sym: "XAU%2FUSD", type: "commodity" },
+  BTCUSD: { name: "Bitcoin", sym: "BTC%2FUSD", type: "crypto" },
+  EURUSD: { name: "Euro/Dollar", sym: "EUR%2FUSD", type: "forex" },
+  GBPUSD: { name: "Pound/Dollar", sym: "GBP%2FUSD", type: "forex" },
+  US30: { name: "Dow Jones", sym: "US30", type: "index" },
+};
+
+const GROWTH_FILE = path.join(__dirname, "growth.json");
 const DAILY_LIMIT = 750;
 const CACHE_TTL = 25 * 60 * 1000; // 25 minutes
 const COOLDOWN_MS = 90 * 60 * 1000; // 90 minutes between auto alerts per instrument
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BOT SETUP
-// ─────────────────────────────────────────────────────────────────────────────
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {
   polling: {
@@ -32,7 +34,6 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, {
   },
 });
 
-// Add a simple HTTP server so Render stays happy
 const http = require("http");
 http
   .createServer((req, res) => {
@@ -40,10 +41,6 @@ http
     res.end("TradingBot is running");
   })
   .listen(process.env.PORT || 3000);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// STATE
-// ─────────────────────────────────────────────────────────────────────────────
 
 let botActive = true;
 let autoAlertsEnabled = true;
@@ -204,6 +201,80 @@ function updateOutcome(id, outcome) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ACCOUNT GROWTH TRACKER
+// Track your balance over time and see projected growth
+// ─────────────────────────────────────────────────────────────────────────────
+
+function loadGrowth() {
+  try {
+    if (fs.existsSync(GROWTH_FILE))
+      return JSON.parse(fs.readFileSync(GROWTH_FILE, "utf8"));
+  } catch {}
+  return { entries: [], startBalance: null };
+}
+
+function saveGrowth(data) {
+  try {
+    fs.writeFileSync(GROWTH_FILE, JSON.stringify(data, null, 2));
+  } catch {}
+}
+
+function addBalanceEntry(balance) {
+  const data = loadGrowth();
+
+  // Set starting balance on first entry
+  if (!data.startBalance) data.startBalance = balance;
+
+  data.entries.push({
+    date: new Date().toISOString().split("T")[0],
+    balance: parseFloat(balance),
+  });
+
+  // Keep last 30 entries only
+  if (data.entries.length > 30) data.entries = data.entries.slice(-30);
+
+  saveGrowth(data);
+  return data;
+}
+
+function getGrowthStats() {
+  const data = loadGrowth();
+  if (!data.entries.length) return null;
+
+  const entries = data.entries;
+  const latest = entries[entries.length - 1].balance;
+  const start = data.startBalance || entries[0].balance;
+  const totalGrowth = (((latest - start) / start) * 100).toFixed(1);
+
+  // Calculate weekly growth rate from last 7 entries
+  const weekEntries = entries.slice(-7);
+  const weekStart = weekEntries[0].balance;
+  const weekGrowthPct =
+    weekEntries.length > 1
+      ? (((latest - weekStart) / weekStart) * 100).toFixed(1)
+      : 0;
+
+  // Project how long to reach targets based on weekly growth rate
+  const weeklyRate =
+    weekEntries.length > 1 ? (latest - weekStart) / weekStart : 0;
+
+  function weeksToTarget(target) {
+    if (weeklyRate <= 0 || latest >= target) return null;
+    return Math.ceil(Math.log(target / latest) / Math.log(1 + weeklyRate));
+  }
+
+  return {
+    current: latest,
+    start: start,
+    totalGrowth,
+    weekGrowthPct,
+    weeksTo50: weeksToTarget(50),
+    weeksTo100: weeksToTarget(100),
+    weeksTo500: weeksToTarget(500),
+    entries,
+  };
+}
+// ─────────────────────────────────────────────────────────────────────────────
 // DRAWDOWN PROTECTION
 // 3 losses in a row = bot pauses for 24 hours automatically
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,6 +410,87 @@ async function fetchCalendar() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// NEWS IMPACT PREDICTION
+// Before big events like CPI or NFP, we fetch the forecast and ask Claude
+// to predict the likely market reaction for gold
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function fetchUpcomingEvents() {
+  try {
+    const cached = getCached("upcoming_events");
+    if (cached) return cached;
+
+    if (!PRICE_API_KEY || !hasCredits(1)) return [];
+
+    // Get next 3 days of events
+    const today = new Date();
+    const end = new Date(today);
+    end.setDate(end.getDate() + 3);
+
+    const startStr = today.toISOString().split("T")[0];
+    const endStr = end.toISOString().split("T")[0];
+
+    const res = await axios.get(
+      `https://api.twelvedata.com/economic_calendar?start_date=${startStr}&end_date=${endStr}&importance=high&apikey=${PRICE_API_KEY}`,
+      { timeout: 8000 },
+    );
+
+    addCredit(1);
+
+    const events = res.data.result || [];
+
+    // Filter for events that affect gold (USD and global events)
+    const goldEvents = events.filter(
+      (e) =>
+        ["USD", "EUR", "GBP", "XAU"].includes(e.currency) ||
+        ["NFP", "CPI", "FOMC", "GDP", "PMI", "PPI"].some((key) =>
+          e.event?.toUpperCase().includes(key),
+        ),
+    );
+
+    const result = goldEvents.slice(0, 5).map((e) => ({
+      event: e.event,
+      currency: e.currency,
+      date: e.date,
+      forecast: e.forecast || "n/a",
+      previous: e.previous || "n/a",
+      impact: e.importance || "high",
+    }));
+
+    setCache("upcoming_events", result);
+    return result;
+  } catch (err) {
+    console.log("Upcoming events error:", err.message);
+    return [];
+  }
+}
+
+async function predictNewsImpact(events) {
+  if (!events.length) return "No major events found in the next 3 days.";
+
+  const eventList = events
+    .map(
+      (e) =>
+        `${e.event} (${e.currency}) on ${e.date.slice(0, 10)} at ${e.date.slice(11, 16)} UTC — Forecast: ${e.forecast} | Previous: ${e.previous}`,
+    )
+    .join("\n");
+
+  const prompt =
+    `You are analyzing upcoming high-impact economic events and their likely effect on XAUUSD (Gold).\n\n` +
+    `UPCOMING EVENTS:\n${eventList}\n\n` +
+    `For each event give a SHORT prediction in this format:\n\n` +
+    `EVENT: [name]\n` +
+    `DATE: [date and time UTC]\n` +
+    `GOLD REACTION: [likely direction — up/down/volatile]\n` +
+    `IF BETTER THAN FORECAST: [gold direction in 5 words]\n` +
+    `IF WORSE THAN FORECAST: [gold direction in 5 words]\n` +
+    `ADVICE: [one sentence — trade or avoid]\n\n` +
+    `Keep each prediction to 6 lines. Plain text only.`;
+
+  return await callClaude(prompt);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TWELVE DATA FETCHER
 // All indicator calls go through here. Checks cache first to save credits.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -437,6 +589,51 @@ async function fetchCandles(symbol, interval, count = 10) {
     low: parseFloat(c.low).toFixed(2),
     close: parseFloat(c.close).toFixed(2),
   }));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MULTI-INSTRUMENT FETCHER
+// Gets price and basic indicators for any supported instrument
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function fetchInstrumentData(symbol) {
+  try {
+    const info = INSTRUMENTS[symbol];
+    if (!info) return null;
+
+    // BTC uses CoinGecko — free, no credits
+    if (symbol === "BTCUSD") {
+      const cached = getCached("btc_price");
+      if (cached) return { symbol, price: cached, name: info.name };
+      const res = await axios.get(
+        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+        { timeout: 10000 },
+      );
+      const price = res.data.bitcoin.usd;
+      setCache("btc_price", price);
+      return { symbol, price, name: info.name };
+    }
+
+    // All others use Twelve Data
+    const data = await tdFetch(
+      "price",
+      `symbol=${info.sym}`,
+      `price_${symbol}`,
+    );
+    await delay(500);
+
+    if (!data?.price) return null;
+
+    return {
+      symbol,
+      name: info.name,
+      price: parseFloat(data.price).toFixed(symbol === "US30" ? 0 : 2),
+      type: info.type,
+    };
+  } catch (err) {
+    console.log(`fetchInstrumentData error (${symbol}):`, err.message);
+    return null;
+  }
 }
 
 async function fetchNews(instrument) {
@@ -1266,6 +1463,196 @@ async function runAnalysis(chatId, instrument, forceRefresh = false) {
 // ─────────────────────────────────────────────────────────────────────────────
 // COMMANDS
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// /eurusd, /gbpusd, /us30 — Analyze other instruments
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.onText(/\/eurusd/, (msg) => {
+  if (isProcessing(msg.chat.id, "eurusd")) return;
+  runAnalysis(msg.chat.id, "EURUSD");
+});
+
+bot.onText(/\/gbpusd/, (msg) => {
+  if (isProcessing(msg.chat.id, "gbpusd")) return;
+  runAnalysis(msg.chat.id, "GBPUSD");
+});
+
+bot.onText(/\/us30/, (msg) => {
+  if (isProcessing(msg.chat.id, "us30")) return;
+  runAnalysis(msg.chat.id, "US30");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /prices — Quick price check for all instruments (uses minimal credits)
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.onText(/\/prices/, async (msg) => {
+  if (isProcessing(msg.chat.id, "prices")) return;
+  const chatId = msg.chat.id;
+  let msgId = null;
+  try {
+    const sent = await bot.sendMessage(chatId, "Fetching all prices...");
+    msgId = sent.message_id;
+
+    const symbols = Object.keys(INSTRUMENTS);
+    const results = [];
+
+    for (const symbol of symbols) {
+      const data = await fetchInstrumentData(symbol);
+      if (data) results.push(data);
+      await delay(600);
+    }
+
+    const session = getSession();
+    let text = `Market Prices\n${session.name} | ${session.utcStr}\n\n`;
+
+    results.forEach((r) => {
+      text += `${r.symbol}: $${parseFloat(r.price).toLocaleString()}\n`;
+    });
+
+    text += `\nUse /gold /eurusd /gbpusd /us30 /btc for full analysis.`;
+
+    try {
+      await bot.deleteMessage(chatId, msgId);
+    } catch {}
+    await bot.sendMessage(chatId, text);
+  } catch (err) {
+    try {
+      if (msgId)
+        await bot.editMessageText(`Error: ${err.message.slice(0, 100)}`, {
+          chat_id: chatId,
+          message_id: msgId,
+        });
+    } catch {
+      bot.sendMessage(chatId, "Error occurred.");
+    }
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /balance — Log your current account balance for growth tracking
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.onText(/\/balance (.+)/, (msg, match) => {
+  const balance = parseFloat(match[1]);
+
+  if (isNaN(balance) || balance <= 0) {
+    bot.sendMessage(msg.chat.id, "Invalid balance. Example: /balance 23.50");
+    return;
+  }
+
+  const data = addBalanceEntry(balance);
+  const stats = getGrowthStats();
+
+  if (!stats) {
+    bot.sendMessage(
+      msg.chat.id,
+      `Balance logged: $${balance}\n\nLog again next week to start tracking growth.`,
+    );
+    return;
+  }
+
+  let text =
+    `Balance Updated\n\n` +
+    `Current: $${stats.current}\n` +
+    `Starting: $${stats.start}\n` +
+    `Total growth: ${stats.totalGrowth}%\n` +
+    `This week: ${stats.weekGrowthPct}%\n\n` +
+    `Projected targets:\n`;
+
+  if (stats.weeksTo50) text += `$50:  ${stats.weeksTo50} weeks\n`;
+  else text += `$50:  Already reached\n`;
+
+  if (stats.weeksTo100) text += `$100: ${stats.weeksTo100} weeks\n`;
+  else text += `$100: Already reached\n`;
+
+  if (stats.weeksTo500) text += `$500: ${stats.weeksTo500} weeks\n`;
+  else text += `$500: Already reached\n`;
+
+  text += `\nLog your balance each week to track progress.`;
+
+  bot.sendMessage(msg.chat.id, text);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /growth — Show full account growth history
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.onText(/\/growth/, (msg) => {
+  const stats = getGrowthStats();
+
+  if (!stats) {
+    bot.sendMessage(
+      msg.chat.id,
+      "No balance data yet.\n\nStart tracking with: /balance 20.00",
+    );
+    return;
+  }
+
+  const recent = stats.entries.slice(-8).reverse();
+  let text =
+    `Account Growth\n\n` +
+    `Current: $${stats.current}\n` +
+    `Started: $${stats.start}\n` +
+    `Total growth: ${stats.totalGrowth}%\n` +
+    `This week: ${stats.weekGrowthPct}%\n\n` +
+    `History (newest first):\n`;
+
+  recent.forEach((e) => {
+    text += `${e.date}: $${e.balance}\n`;
+  });
+
+  text += `\nTargets:\n`;
+  text += stats.weeksTo50
+    ? `$50:  ${stats.weeksTo50} weeks away\n`
+    : `$50:  Reached\n`;
+  text += stats.weeksTo100
+    ? `$100: ${stats.weeksTo100} weeks away\n`
+    : `$100: Reached\n`;
+  text += stats.weeksTo500
+    ? `$500: ${stats.weeksTo500} weeks away\n`
+    : `$500: Reached\n`;
+
+  bot.sendMessage(msg.chat.id, text);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /news — Upcoming high-impact events with gold impact prediction
+// ─────────────────────────────────────────────────────────────────────────────
+
+bot.onText(/\/news/, async (msg) => {
+  if (isProcessing(msg.chat.id, "news")) return;
+  const chatId = msg.chat.id;
+  let msgId = null;
+  try {
+    const sent = await bot.sendMessage(
+      chatId,
+      "Fetching upcoming news events and predicting gold impact...\nThis may take 15 seconds.",
+    );
+    msgId = sent.message_id;
+
+    const events = await fetchUpcomingEvents();
+    const prediction = await predictNewsImpact(events);
+
+    try {
+      await bot.deleteMessage(chatId, msgId);
+    } catch {}
+    await bot.sendMessage(
+      chatId,
+      `News Impact Prediction\nNext 3 days — Gold (XAUUSD)\n\n${prediction}`,
+    );
+  } catch (err) {
+    try {
+      if (msgId)
+        await bot.editMessageText(`Error: ${err.message.slice(0, 100)}`, {
+          chat_id: chatId,
+          message_id: msgId,
+        });
+    } catch {
+      bot.sendMessage(chatId, "Error occurred.");
+    }
+  }
+});
 
 bot.onText(/\/start/, (msg) => {
   botActive = true;
@@ -1273,33 +1660,36 @@ bot.onText(/\/start/, (msg) => {
     msg.chat.id,
     `TradingBot Pro — $20 Account\n\n` +
       `Bot is ACTIVE.\n\n` +
-      `What is new in this version:\n` +
-      `- SMC analysis: BOS, CHoCH, Order Blocks, FVG\n` +
-      `- Auto-alerts every 30 mins during London/NY\n` +
-      `- News warnings before high-impact events\n` +
-      `- 8-factor confluence scoring\n\n` +
-      `MARKET COMMANDS:\n` +
-      `/gold — Analyze XAUUSD\n` +
-      `/btc — Analyze BTCUSD\n` +
-      `/both — Analyze both\n` +
-      `/refresh — Force fresh data\n` +
-      `/confluence — Live confluence scores\n\n` +
+      `INSTRUMENTS:\n` +
+      `/gold — XAUUSD (Gold)\n` +
+      `/eurusd — EUR/USD\n` +
+      `/gbpusd — GBP/USD\n` +
+      `/us30 — Dow Jones\n` +
+      `/btc — Bitcoin\n` +
+      `/prices — All prices at once\n\n` +
+      `ANALYSIS:\n` +
+      `/both — Analyze gold and BTC\n` +
+      `/confluence — Live confluence scores\n` +
+      `/refresh — Force fresh data\n\n` +
       `AUTO ALERTS:\n` +
       `/alerts on — Enable auto scanning\n` +
       `/alerts off — Disable auto scanning\n\n` +
-      `INFO:\n` +
-      `/session — Current session\n` +
-      `/calendar — Economic events today\n` +
-      `/feargreed — BTC sentiment\n` +
-      `/credits — API usage\n\n` +
+      `NEWS:\n` +
+      `/news — Upcoming events + gold prediction\n` +
+      `/calendar — Today high-impact events\n` +
+      `/feargreed — BTC Fear & Greed index\n\n` +
+      `ACCOUNT:\n` +
+      `/balance 23.50 — Log your balance\n` +
+      `/growth — Growth history and targets\n` +
+      `/credits — API usage today\n\n` +
       `JOURNAL:\n` +
-      `/journal — Trade history\n` +
-      `/win [n] — Mark win\n` +
-      `/loss [n] — Mark loss\n\n` +
+      `/journal — Trade history and win rate\n` +
+      `/win [n] — Mark trade as win\n` +
+      `/loss [n] — Mark trade as loss\n\n` +
       `CONTROLS:\n` +
       `/stop — Pause bot\n` +
       `/resume — Resume bot\n` +
-      `/status — Bot status\n\n` +
+      `/status — Full bot status\n\n` +
       `/risk | /sizing | /ask [question] | /help`,
   );
 });
@@ -1639,21 +2029,40 @@ bot.onText(/\/help/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `Commands\n\n` +
+      `INSTRUMENTS:\n` +
       `/gold — XAUUSD analysis\n` +
-      `/btc — BTCUSD analysis\n` +
-      `/both — Both markets\n` +
-      `/refresh — Clear cache\n` +
-      `/confluence — Scores\n` +
-      `/alerts on/off — Auto scanning\n` +
-      `/session — Session info\n` +
-      `/calendar — Economic events\n` +
-      `/feargreed — BTC sentiment\n` +
-      `/credits — API usage\n` +
-      `/journal — Trade log\n` +
-      `/win [n] | /loss [n] — Log outcome\n` +
-      `/status — Full bot status\n` +
-      `/stop | /resume — Bot controls\n` +
-      `/risk | /sizing — Account rules\n` +
+      `/eurusd — EUR/USD analysis\n` +
+      `/gbpusd — GBP/USD analysis\n` +
+      `/us30 — Dow Jones analysis\n` +
+      `/btc — Bitcoin analysis\n` +
+      `/both — Gold and BTC together\n` +
+      `/prices — All prices at once\n\n` +
+      `ANALYSIS:\n` +
+      `/confluence — Live confluence scores\n` +
+      `/refresh — Clear cache, fresh data\n\n` +
+      `AUTO ALERTS:\n` +
+      `/alerts on — Enable auto scanning\n` +
+      `/alerts off — Disable auto scanning\n\n` +
+      `NEWS:\n` +
+      `/news — Upcoming events + gold prediction\n` +
+      `/calendar — Today high-impact events\n` +
+      `/feargreed — BTC Fear & Greed\n\n` +
+      `ACCOUNT:\n` +
+      `/balance 23.50 — Log your balance\n` +
+      `/growth — Growth history and targets\n` +
+      `/credits — API usage today\n\n` +
+      `JOURNAL:\n` +
+      `/journal — Trade history\n` +
+      `/win [n] — Mark win\n` +
+      `/loss [n] — Mark loss\n\n` +
+      `CONTROLS:\n` +
+      `/stop — Pause bot\n` +
+      `/resume — Resume bot\n` +
+      `/status — Bot status\n\n` +
+      `OTHER:\n` +
+      `/risk — Risk rules\n` +
+      `/sizing — Position sizing\n` +
+      `/session — Current session\n` +
       `/ask [question] — Ask anything\n` +
       `/help — This menu`,
   );
