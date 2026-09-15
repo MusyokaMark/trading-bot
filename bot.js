@@ -865,6 +865,29 @@ function scoreConfluence(data) {
       bearish++;
       factors.push(`Bearish FVG at $${smc.fvg1h.bottom}–$${smc.fvg1h.top}`);
     }
+  } // Factor 8: SMC Fair Value Gap
+  // FVG should only count if it matches the overall bias direction
+  if (smc?.fvg1h) {
+    const fvgBullish = smc.fvg1h.type === "BULLISH";
+    const fvgBearish = smc.fvg1h.type === "BEARISH";
+
+    // Only count FVG if it aligns with price position
+    // Bullish FVG below price = support = bullish factor
+    // Bearish FVG above price = resistance = bearish factor
+    const currentPrice = parseFloat(price);
+    const fvgMid = parseFloat(smc.fvg1h.midpoint || smc.fvg1h.top);
+
+    if (fvgBullish && currentPrice > fvgMid) {
+      bullish++;
+      factors.push(`Bullish FVG below price — support at $${smc.fvg1h.bottom}`);
+    } else if (fvgBearish && currentPrice < fvgMid) {
+      bearish++;
+      factors.push(`Bearish FVG above price — resistance at $${smc.fvg1h.top}`);
+    } else {
+      factors.push(
+        `FVG present but not yet tested ($${smc.fvg1h.bottom}–$${smc.fvg1h.top})`,
+      );
+    }
   }
 
   const direction =
@@ -1013,17 +1036,17 @@ RULES:
 - No trade during high-impact news
 - Every level must come from the candle data
 
-OUTPUT FORMAT — keep it short, plain text, no symbols:
+OUTPUT FORMAT — plain text only, no symbols, always use this exact format whether signal or no trade:
 
-INSTRUMENT: [XAUUSD or BTCUSD]
 SIGNAL: [BUY / SELL / NO TRADE]
-ENTRY: [price]
-STOP LOSS: [price]
-TAKE PROFIT 1: [price]
-TAKE PROFIT 2: [price]
-REASON: [one sentence — the main technical reason]
+ENTRY: [price or N/A]
+SL: [price or N/A]
+TP1: [price or N/A]
+TP2: [price or N/A]
+WHY: [one sentence — main technical reason]
 
-If NO TRADE: one sentence on what to wait for.`;
+If NO TRADE also add:
+WAIT FOR: [one sentence — exact price action needed before entry]`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLAUDE API
@@ -1708,9 +1731,6 @@ bot.on("message", (msg) => {
 console.log(`\nTradingBot Pro — ${new Date().toISOString()}`);
 console.log(`Chat IDs: ${ALERT_CHAT_IDS.join(", ") || "NONE SET"}`);
 console.log(`Credits today: ${loadCredits().used} used / ${DAILY_LIMIT} limit`);
-console.log(
-  `Auto-alerts: ${autoAlertsEnabled ? "ON" : "OFF"} (every 30 mins, London/NY sessions only)`,
-);
-console.log(`SMC analysis: BOS, CHoCH, Order Blocks, FVG — enabled`);
-console.log(`News protection: auto-blocks trading during high-impact events`);
+console.log(`Auto-alerts: ${autoAlertsEnabled ? "ON" : "OFF"}`);
+console.log(`SMC analysis: enabled`);
 console.log(`Cache TTL: 25 minutes\n`);
